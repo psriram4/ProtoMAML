@@ -6,14 +6,17 @@ import copy
 import torch.nn.functional as F
 
 class ProtoMAML(nn.Module):
-    def __init__(self, num_steps=1, embed_dim=64, lr=1e-3, lr_inner=0.1, lr_output=0.1, adapt_lr=0.1):
+    def __init__(self, num_train_steps=1, num_test_steps=1, embed_dim=64, lr=1e-3, lr_inner=0.01, \
+        lr_output=0.01, adapt_lr=0.01, device=None):
         super().__init__()
-        self.num_steps = num_steps
+        self.num_train_steps = num_train_steps
+        self.num_test_steps = num_test_steps
         self.embed_dim = embed_dim
         self.lr = lr 
         self.lr_inner = lr_inner
         self.lr_output = lr_output
         self.adapt_lr = adapt_lr
+        self.device = device
         self.init_embedder()
         self.optimizers = self.configure_optimizers()
 
@@ -25,6 +28,7 @@ class ProtoMAML(nn.Module):
             num_init_features=64,
             num_classes=self.embed_dim
         )
+        self.embedder.to(self.device)
 
     def configure_optimizers(self):
         optim = torch.optim.AdamW(self.embedder.parameters(), lr=self.lr)
@@ -42,12 +46,13 @@ class ProtoMAML(nn.Module):
         prototypes = torch.stack(prototypes, dim=0)
         return prototypes
 
-    def compute_adapted_params(self, support_imgs, support_labels):
+    def compute_adapted_params(self, support_imgs, support_labels, mode="train"):
         embed_feats = self.embedder(support_imgs)
         prototypes = self.calculate_prototypes(embed_feats, support_labels)
 
         model_copy = copy.deepcopy(self.embedder)
         model_copy.train()
+        model_copy.to(self.device)
         adapt_optim = torch.optim.SGD(model_copy.parameters(), lr=self.adapt_lr)
         adapt_optim.zero_grad()
 
@@ -59,20 +64,25 @@ class ProtoMAML(nn.Module):
         linear_weight = init_linear_weight.detach().requires_grad_()
         linear_bias = init_linear_bias.detach().requires_grad_()
 
-        for _ in range(self.num_steps):
+        linear_weight.to(self.device)
+        linear_bias.to(self.device)
+
+        num_steps = self.num_train_steps if mode == "train" else self.num_test_steps
+
+        for _ in range(num_steps):
             feats = model_copy(support_imgs)
             outputs = F.linear(feats, linear_weight, linear_bias) # shape: (N*K, num_classes)
             loss = F.cross_entropy(outputs, support_labels)
             loss.backward()
             adapt_optim.step()
+
+            linear_weight.data = linear_weight.data - linear_weight.grad * self.lr_output
+            linear_bias.data = linear_bias.data - linear_bias.grad * self.lr_output
+
+            linear_weight.grad.fill_(0)
+            linear_bias.grad.fill_(0)
             adapt_optim.zero_grad()
 
-            with torch.no_grad():
-                linear_weight = linear_weight - linear_weight.grad * self.lr_output
-                linear_bias = linear_bias - linear_bias.grad * self.lr_output
-
-                linear_weight.grad = None
-                linear_bias.grad = None
 
         linear_weight = init_linear_weight + (linear_weight - init_linear_weight).detach()
         linear_bias = init_linear_bias + (linear_bias - init_linear_bias).detach()
@@ -80,43 +90,50 @@ class ProtoMAML(nn.Module):
         return model_copy, linear_weight, linear_bias
 
 
-    def training_step(self, batch, batch_idx):
-        support_imgs, support_labels, query_imgs, query_labels = batch
-        support_imgs = torch.permute(torch.tensor(support_imgs).float(), (0, 3, 1, 2))
-        finetuned_model = self.compute_adapted_params(support_imgs, torch.tensor(support_labels))
-        finetuned_embedder, linear_weight, linear_bias = finetuned_model
+    def training_step(self, tasks, idxes):
+        for batch in tasks:
+            support_imgs, support_labels, query_imgs, query_labels = batch
+            support_imgs = torch.permute(support_imgs.float(), (0, 3, 1, 2))
+            finetuned_model = self.compute_adapted_params(support_imgs, support_labels, mode="train")
+            finetuned_embedder, linear_weight, linear_bias = finetuned_model
 
-        query_imgs = torch.permute(torch.tensor(query_imgs).float(), (0, 3, 1, 2))
-        feats = finetuned_embedder(query_imgs)
-        outputs = F.linear(feats, linear_weight, linear_bias)
+            query_imgs = torch.permute(query_imgs.float(), (0, 3, 1, 2))
+            feats = finetuned_embedder(query_imgs)
+            outputs = F.linear(feats, linear_weight, linear_bias)
 
-        loss = F.cross_entropy(outputs, torch.tensor(query_labels))
-        loss.backward()
+            loss = F.cross_entropy(outputs, query_labels)
+            loss.backward()
 
-        for real_param, copy_param in zip(self.embedder.parameters(), finetuned_embedder.parameters()):
-            real_param.grad += copy_param.grad
+            for real_param, copy_param in zip(self.embedder.parameters(), finetuned_embedder.parameters()):
+                real_param.grad += copy_param.grad
 
         opt = self.optimizers
         opt.step()
         opt.zero_grad()
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, tasks, idxs):
         accuracies = []
-        support_imgs, support_labels, query_imgs, query_labels = batch
-        support_imgs = torch.permute(torch.tensor(support_imgs).float(), (0, 3, 1, 2))
-        finetuned_model = self.compute_adapted_params(support_imgs, torch.tensor(support_labels))
-        finetuned_embedder, linear_weight, linear_bias = finetuned_model
+        losses = []
+        for batch in tasks:
+            support_imgs, support_labels, query_imgs, query_labels = batch
+            support_imgs = torch.permute(support_imgs.float(), (0, 3, 1, 2))
+            finetuned_model = self.compute_adapted_params(support_imgs, support_labels, mode="test")
+            finetuned_embedder, linear_weight, linear_bias = finetuned_model
 
-        query_imgs = torch.permute(torch.tensor(query_imgs).float(), (0, 3, 1, 2))
-        feats = finetuned_embedder(query_imgs)
-        outputs = F.linear(feats, linear_weight, linear_bias)
+            query_imgs = torch.permute(query_imgs.float(), (0, 3, 1, 2))
+            feats = finetuned_embedder(query_imgs)
+            outputs = F.linear(feats, linear_weight, linear_bias)
 
-        loss = F.cross_entropy(outputs, torch.tensor(query_labels))
-        acc = (outputs.argmax(dim=1) == torch.tensor(query_labels).argmax(dim=1)).float()
-        print(f"Validation loss: {loss}")
+            loss = F.cross_entropy(outputs, query_labels)
+            acc = (outputs.argmax(dim=1) == query_labels.argmax(dim=1)).float()
+        
+            losses.append(loss.mean().detach())
+            accuracies.append(acc.mean().detach())
 
-        accuracies.append(acc.mean().detach())
         print(f"Validation Accuracy: {sum(accuracies)/len(accuracies)}")
+        print(f"Validation Loss: {sum(losses)/len(losses)}")
+
+        return sum(accuracies)/len(accuracies), sum(losses)/len(losses)
         
 
 
